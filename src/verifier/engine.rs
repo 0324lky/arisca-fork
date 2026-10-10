@@ -3,7 +3,7 @@ use super::{
     ReductionState, SizeGuard, Substitution, VarDomain, process_cone,
 };
 use crate::Result;
-use crate::bipoly::{Polynomial, VarId};
+use crate::bipoly::{Polynomial, Term, VarId};
 use crate::json::ToJson;
 
 
@@ -12,6 +12,22 @@ pub struct ReductionEngine<'a> {
     pub ctx: &'a ReductionContext<'a>,
     pub state: ReductionState,
     pub size_limit: Option<usize>,
+    /// Every term was normalized by the last normalization (it was a full one, or only touched
+    /// terms changed since one): a later normalization may then check the touched terms only.
+    normalized: bool,
+}
+
+/// The vanishing-monomial rule: a term holding two consecutive negative variables is zero.
+fn vanishes(term: &Term) -> bool {
+    for pair in term.vars().windows(2) {
+        let (var_i, var_j) = (pair[0], pair[1]);
+        if var_j >= 0 {
+            return false;
+        } else if (var_j - var_i) == 1 {
+            return true;
+        }
+    }
+    false
 }
 
 /// The engine at a point it can return to (see [`ReductionEngine::checkpoint`]).
@@ -20,6 +36,7 @@ pub struct Checkpoint {
     flip_manager: Option<FlipManager>,
     seq_len: usize,
     sizes_len: usize,
+    normalized: bool,
 }
 
 impl<'a> ReductionEngine<'a> {
@@ -32,6 +49,7 @@ impl<'a> ReductionEngine<'a> {
             flip_manager: self.state.flip_manager.clone(),
             seq_len: self.state.global_seq.len(),
             sizes_len: self.state.poly_sizes.len(),
+            normalized: self.normalized,
         }
     }
 
@@ -42,6 +60,7 @@ impl<'a> ReductionEngine<'a> {
         self.state.flip_manager = checkpoint.flip_manager.clone();
         self.state.global_seq.truncate(checkpoint.seq_len);
         self.state.poly_sizes.truncate(checkpoint.sizes_len);
+        self.normalized = checkpoint.normalized;
     }
 
     /// Keeps the current state and stops recording.
@@ -60,24 +79,28 @@ impl<'a> ReductionEngine<'a> {
             ctx,
             state,
             size_limit,
+            normalized: false,
         }
     }
 
-    fn normalize(&mut self) {
-        if let Some(modulus) = self.ctx.modulus {
-            self.state.poly.mod_by_const(modulus);
+    /// Reduces every coefficient modulo the output range and drops vanishing monomials. After a
+    /// full pass only the terms a substitution touched can need either, so with occurrence
+    /// counts (the main polynomial) and a small update only those are checked.
+    fn normalize(&mut self, touched: &[Term]) {
+        let poly = &mut self.state.poly;
+        if self.normalized
+            && poly.tracks_occurrences()
+            && self.state.flip_manager.is_none()
+            && touched.len() * 8 <= poly.size()
+        {
+            poly.normalize_terms(touched, self.ctx.modulus, vanishes);
+            return;
         }
-        self.state.poly.remove_mono_by(|m, _| {
-            for pair in m.vars().windows(2) {
-                let (var_i, var_j) = (pair[0], pair[1]);
-                if var_j >= 0 {
-                    return false;
-                } else if (var_j - var_i) == 1 {
-                    return true;
-                }
-            }
-            false
-        });
+        if let Some(modulus) = self.ctx.modulus {
+            poly.mod_by_const(modulus);
+        }
+        poly.remove_mono_by(|term, _| vanishes(term));
+        self.normalized = true;
     }
 
     fn write_partial_meta(&self) -> Result<()> {
@@ -105,15 +128,15 @@ impl<'a> ReductionEngine<'a> {
             gate_poly
         };
 
-        if let Some(guard) = guard {
+        let touched = if let Some(guard) = guard {
             self.state
                 .poly
-                .substitute_by_poly_checked(&var, &gate_poly, guard)?;
+                .substitute_by_poly_checked(&var, &gate_poly, guard)?
         } else {
-            self.state.poly.substitute_by_poly(&var, &gate_poly);
-        }
+            self.state.poly.substitute_by_poly(&var, &gate_poly)
+        };
 
-        self.normalize();
+        self.normalize(&touched);
 
         if let Some(fm) = &mut self.state.flip_manager {
             fm.greedy_flip(&mut self.state.poly, &new_vars);
@@ -139,6 +162,7 @@ impl<'a> ReductionEngine<'a> {
                     self.state.flip_manager.as_mut(),
                 )?;
                 self.state.poly.replace(new_poly);
+                self.normalized = false;
                 self.state.global_seq.extend(cone_seq);
                 self.state.poly_sizes.extend(poly_sizes);
                 Ok(None)

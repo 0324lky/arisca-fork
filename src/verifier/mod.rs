@@ -525,7 +525,7 @@ pub(crate) fn verify_with_cancel(
             }),
     );
 
-    let main_state = ReductionState {
+    let mut main_state = ReductionState {
         poly_sizes: vec![start_poly.size()],
         poly: start_poly,
         var_domain: match cfg.mode {
@@ -542,6 +542,11 @@ pub(crate) fn verify_with_cancel(
         },
         global_seq: Vec::new(),
     };
+    // The main polynomial counts the terms of every variable: candidate ordering reads the
+    // counts, and the search for a variable's terms ends at its last one.
+    if let (Some(&lo), Some(&hi)) = (vars.iter().min(), vars.iter().max()) {
+        main_state.poly.track_occurrences(lo, hi);
+    }
 
     let mut main_policy: Box<dyn ReductionPolicy> = match cfg.mode {
         ReductionMode::BFS | ReductionMode::DFS => Box::new(DefaultPolicy {}),

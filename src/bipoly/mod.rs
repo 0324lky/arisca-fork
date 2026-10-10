@@ -15,20 +15,72 @@ enum Change {
     Whole(BTreeMap<Term, Integer>),
 }
 
+/// How many terms hold each variable of a range, kept up to date on every change of the terms.
+struct OccurrenceIndex {
+    lo: i64,
+    counts: Vec<u32>,
+}
+
+impl OccurrenceIndex {
+    fn new(lo: VarId, hi: VarId) -> Self {
+        let len = (i64::from(hi) - i64::from(lo) + 1).max(0) as usize;
+        Self {
+            lo: i64::from(lo),
+            counts: vec![0; len],
+        }
+    }
+
+    fn slot(&self, v: VarId) -> Option<usize> {
+        let i = i64::from(v) - self.lo;
+        (0..self.counts.len() as i64)
+            .contains(&i)
+            .then_some(i as usize)
+    }
+
+    fn count(&self, v: VarId) -> Option<u32> {
+        self.slot(v).map(|i| self.counts[i])
+    }
+
+    fn add(&mut self, term: &Term) {
+        for &v in term.vars() {
+            if let Some(i) = self.slot(v) {
+                self.counts[i] += 1;
+            }
+        }
+    }
+
+    fn remove(&mut self, term: &Term) {
+        for &v in term.vars() {
+            if let Some(i) = self.slot(v) {
+                self.counts[i] -= 1;
+            }
+        }
+    }
+
+    fn rebuild(&mut self, terms: &BTreeMap<Term, Integer>) {
+        self.counts.fill(0);
+        for term in terms.keys() {
+            self.add(term);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Polynomial {
     pub terms: BTreeMap<Term, Integer>,
-    /// The changes since the last checkpoint, while recording. A recording polynomial must be
-    /// changed through its methods, not through `terms`, or a rollback cannot restore it.
+    /// The changes since the last checkpoint, while recording. A recording or occurrence-tracking
+    /// polynomial must be changed through its methods, not through `terms`.
     log: Option<Vec<Change>>,
+    /// Occurrence counts, while tracking (see [`Polynomial::track_occurrences`]).
+    index: Option<OccurrenceIndex>,
 }
 
 impl Clone for Polynomial {
-    /// A copy carries the terms only: recording belongs to the original.
+    /// A copy carries the terms only: recording and occurrence counts belong to the original.
     fn clone(&self) -> Self {
         Self {
             terms: self.terms.clone(),
-            log: None,
+            ..Self::default()
         }
     }
 }
@@ -52,13 +104,30 @@ impl Polynomial {
         // In reverse, so a term changed more than once ends on its value at the checkpoint.
         for change in log.into_iter().rev() {
             match change {
-                Change::Term(term, Some(coeff)) => {
-                    self.terms.insert(term, coeff);
-                }
+                Change::Term(term, Some(coeff)) => match self.terms.entry(term) {
+                    Entry::Vacant(entry) => {
+                        if let Some(index) = &mut self.index {
+                            index.add(entry.key());
+                        }
+                        entry.insert(coeff);
+                    }
+                    Entry::Occupied(mut entry) => {
+                        entry.insert(coeff);
+                    }
+                },
                 Change::Term(term, None) => {
-                    self.terms.remove(&term);
+                    if self.terms.remove(&term).is_some()
+                        && let Some(index) = &mut self.index
+                    {
+                        index.remove(&term);
+                    }
                 }
-                Change::Whole(terms) => self.terms = terms,
+                Change::Whole(terms) => {
+                    self.terms = terms;
+                    if let Some(index) = &mut self.index {
+                        index.rebuild(&self.terms);
+                    }
+                }
             }
         }
     }
@@ -81,24 +150,92 @@ impl Polynomial {
         if let Some(log) = &mut self.log {
             log.push(Change::Whole(old));
         }
+        if let Some(index) = &mut self.index {
+            index.rebuild(&self.terms);
+        }
+    }
+
+    /// Keeps, from now on, the number of terms that hold each variable in `lo..=hi`.
+    pub fn track_occurrences(&mut self, lo: VarId, hi: VarId) {
+        let mut index = OccurrenceIndex::new(lo, hi);
+        index.rebuild(&self.terms);
+        self.index = Some(index);
+    }
+
+    pub fn tracks_occurrences(&self) -> bool {
+        self.index.is_some()
+    }
+
+    /// The number of terms that hold `v`, if it is tracked.
+    pub fn occurrences(&self, v: VarId) -> Option<u32> {
+        self.index.as_ref()?.count(v)
+    }
+
+    /// The terms that hold `v`, in term order. Terms are ordered by their variables, smallest
+    /// first, so every term holding `v` comes before the first term whose smallest variable is
+    /// above `v`; with a known count the scan also ends at the last of them.
+    fn terms_with(&self, v: &VarId) -> Vec<Term> {
+        let Some(n) = self.occurrences(*v) else {
+            return self
+                .terms
+                .keys()
+                .filter(|t| t.contains(v))
+                .cloned()
+                .collect();
+        };
+        let mut found = Vec::with_capacity(n as usize);
+        for term in self.terms.keys() {
+            if found.len() == n as usize || term.vars().first().is_some_and(|first| first > v) {
+                break;
+            }
+            if term.contains(v) {
+                found.push(term.clone());
+            }
+        }
+        found
     }
 
     /// Removes the terms that hold `v` and returns them, in term order.
     pub(crate) fn remove_terms_with(&mut self, v: &VarId) -> Vec<(Term, Integer)> {
-        let found: Vec<Term> = self
-            .terms
-            .keys()
-            .filter(|t| t.contains(v))
-            .cloned()
-            .collect();
-        found
+        self.terms_with(v)
             .into_iter()
             .map(|term| {
                 self.note(&term);
                 let coeff = self.terms.remove(&term).expect("a found term is present");
+                if let Some(index) = &mut self.index {
+                    index.remove(&term);
+                }
                 (term, coeff)
             })
             .collect()
+    }
+
+    /// Reduces the coefficients of `terms` modulo `modulus` and drops those that become zero or
+    /// satisfy `vanishes` -- what a full normalization does to them; terms absent are skipped.
+    pub fn normalize_terms<F>(&mut self, terms: &[Term], modulus: Option<&Integer>, vanishes: F)
+    where
+        F: Fn(&Term) -> bool,
+    {
+        for term in terms {
+            let Some(coeff) = self.terms.get(term) else {
+                continue;
+            };
+            let reduce = modulus.is_some_and(|n| coeff.cmp_abs(n) != Ordering::Less);
+            if !reduce && !vanishes(term) {
+                continue;
+            }
+            self.note(term);
+            let coeff = self.terms.get_mut(term).expect("present");
+            if let Some(n) = modulus {
+                *coeff %= n;
+            }
+            if coeff.is_zero() || vanishes(term) {
+                self.terms.remove(term);
+                if let Some(index) = &mut self.index {
+                    index.remove(term);
+                }
+            }
+        }
     }
 
     pub fn from_constant(c: Integer) -> Self {
@@ -184,10 +321,16 @@ impl Polynomial {
                 let c = entry.get_mut();
                 *c += coeff;
                 if c.is_zero() {
-                    entry.remove();
+                    let (term, _) = entry.remove_entry();
+                    if let Some(index) = &mut self.index {
+                        index.remove(&term);
+                    }
                 }
             }
             Entry::Vacant(entry) => {
+                if let Some(index) = &mut self.index {
+                    index.add(entry.key());
+                }
                 entry.insert(coeff);
             }
         }
@@ -243,24 +386,22 @@ impl Polynomial {
         res
     }
 
-    pub fn substitute_by_poly(&mut self, v: &VarId, poly: &Polynomial) {
+    /// Substitutes `poly` for `v` and returns the terms the result added to (they may need
+    /// normalizing; every other term is unchanged).
+    pub fn substitute_by_poly(&mut self, v: &VarId, poly: &Polynomial) -> Vec<Term> {
         let mut new_poly = Polynomial::new();
         for (term, coeff) in self.remove_terms_with(v) {
             let new_term = term.remove_var(v).expect("the term holds v");
             new_poly += Polynomial::from_term(new_term, coeff) * poly;
         }
+        let touched = new_poly.terms.keys().cloned().collect();
         *self += new_poly;
+        touched
     }
 
     pub fn neg_var(&mut self, v: &VarId) {
         let mut extracted_poly = Self::new();
-        let found: Vec<Term> = self
-            .terms
-            .keys()
-            .filter(|t| t.contains(v))
-            .cloned()
-            .collect();
-        for term in found {
+        for term in self.terms_with(v) {
             self.note(&term);
             let coeff = self.terms.get_mut(&term).expect("a found term is present");
             extracted_poly.insert(term.remove_var(v).expect("the term holds v"), coeff.clone());
@@ -296,9 +437,14 @@ impl Polynomial {
                 self.note(term);
             }
         }
-        self.terms.retain(|_, coeff| {
+        let index = &mut self.index;
+        self.terms.retain(|term, coeff| {
             *coeff %= n;
-            !coeff.is_zero()
+            let keep = !coeff.is_zero();
+            if !keep && let Some(index) = index.as_mut() {
+                index.remove(term);
+            }
+            keep
         });
     }
 
@@ -307,7 +453,14 @@ impl Polynomial {
         F: Fn(&Term, &Integer) -> bool,
     {
         if self.log.is_none() {
-            self.terms.retain(|term, coeff| !f(term, coeff));
+            let index = &mut self.index;
+            self.terms.retain(|term, coeff| {
+                let remove = f(term, coeff);
+                if remove && let Some(index) = index.as_mut() {
+                    index.remove(term);
+                }
+                !remove
+            });
             return;
         }
         let removed: Vec<Term> = self
@@ -319,6 +472,9 @@ impl Polynomial {
         for term in removed {
             self.note(&term);
             self.terms.remove(&term);
+            if let Some(index) = &mut self.index {
+                index.remove(&term);
+            }
         }
     }
 }

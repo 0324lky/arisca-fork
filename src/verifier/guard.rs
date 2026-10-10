@@ -97,17 +97,20 @@ impl Polynomial {
         Ok(())
     }
 
+    /// [`substitute_by_poly`](Polynomial::substitute_by_poly) under `guard`.
     pub fn substitute_by_poly_checked(
         &mut self,
         v: &VarId,
         poly: &Polynomial,
         guard: &SizeGuard,
-    ) -> Result<(), SizeLimitExceeded> {
+    ) -> Result<Vec<Term>, SizeLimitExceeded> {
         let mut new_poly = Polynomial::new();
         for (term, coeff) in self.remove_terms_with(v) {
             let new_term = term.remove_var(v).expect("the term holds v");
             new_poly += Polynomial::from_term(new_term, coeff) * poly;
         }
-        self.add_assign_checked(new_poly, guard)
+        let touched = new_poly.terms.keys().cloned().collect();
+        self.add_assign_checked(new_poly, guard)?;
+        Ok(touched)
     }
 }

@@ -125,6 +125,29 @@ impl LazyGreedyPolicy {
         let mut stats: Vec<(_, u32)> = candidates.iter().map(|&v| (v, 0)).collect();
         stats.sort_by_key(|(v, _)| *v);
 
+        if let Some(counts) = stats
+            .iter()
+            .map(|&(v, _)| poly.occurrences(v))
+            .collect::<Option<Vec<u32>>>()
+        {
+            for (stat, count) in stats.iter_mut().zip(counts) {
+                stat.1 = count;
+            }
+        } else {
+            Self::count_occurrences(&mut stats, poly);
+        }
+
+        stats.sort_by_key(|(v, count)| {
+            let sub_size = substitutions.get(v).map(|s| s.size()).unwrap_or(0) as u32;
+            count
+                .saturating_mul(sub_size)
+                .saturating_mul(*self.penalty.entry(*v).or_insert(1))
+        });
+        stats.into_iter().map(|(v, _)| v).collect()
+    }
+
+    /// Counts, for each candidate of `stats` (sorted by variable), the terms of `poly` holding it.
+    fn count_occurrences(stats: &mut [(VarId, u32)], poly: &Polynomial) {
         let min_q = stats.first().unwrap().0;
         let max_q = stats.last().unwrap().0;
 
@@ -153,13 +176,5 @@ impl LazyGreedyPolicy {
                 }
             }
         }
-
-        stats.sort_by_key(|(v, count)| {
-            let sub_size = substitutions.get(v).map(|s| s.size()).unwrap_or(0) as u32;
-            count
-                .saturating_mul(sub_size)
-                .saturating_mul(*self.penalty.entry(*v).or_insert(1))
-        });
-        stats.into_iter().map(|(v, _)| v).collect()
     }
 }
