@@ -5,7 +5,8 @@ use crate::{
 };
 
 use rand::{seq::SliceRandom, thread_rng};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 const PROBE_ABORT_RATIO: usize = 5;
 
@@ -60,17 +61,22 @@ impl ReductionPolicy for LazyGreedyPolicy {
             return Ok(ReductionAction::Reduce(candidates[0]));
         }
 
-        let candidates = self.sort_queue_by_occ_penalty(
+        // The candidates in (key, variable) order, taken one at a time: most decisions accept
+        // one of the first, so they are not all sorted.
+        let mut candidates = self.sort_queue_by_occ_penalty(
             &candidates,
             &engine.state.poly,
             &engine.ctx.substitutions,
         );
+        let Some(&Reverse((_, first_candidate))) = candidates.peek() else {
+            return Ok(ReductionAction::Stop);
+        };
         let current_size = engine.state.poly.size();
         let mut best_candidate: Option<(f64, VarId)> = None;
 
         let guard = SizeGuard::new(current_size.saturating_mul(PROBE_ABORT_RATIO));
         let checkpoint = engine.checkpoint();
-        for &var in &candidates {
+        while let Some(Reverse((_, var))) = candidates.pop() {
             if let Err(err) = engine.reduce_var(var, Some(&guard)) {
                 debug_step!(engine.name; fallback; "Probing failed", var; "Error: {:?}", err);
                 engine.restore(&checkpoint);
@@ -103,7 +109,7 @@ impl ReductionPolicy for LazyGreedyPolicy {
             engine.reduce_var(var, Some(&guard))?;
             return Ok(ReductionAction::Skip);
         } else {
-            return Ok(ReductionAction::Reduce(candidates[0]));
+            return Ok(ReductionAction::Reduce(first_candidate));
         }
     }
 }
@@ -121,9 +127,8 @@ impl LazyGreedyPolicy {
         candidates: &[VarId],
         poly: &Polynomial,
         substitutions: &HashMap<VarId, Substitution>,
-    ) -> Vec<VarId> {
+    ) -> BinaryHeap<Reverse<(u32, VarId)>> {
         let mut stats: Vec<(_, u32)> = candidates.iter().map(|&v| (v, 0)).collect();
-        stats.sort_by_key(|(v, _)| *v);
 
         if let Some(counts) = stats
             .iter()
@@ -134,22 +139,21 @@ impl LazyGreedyPolicy {
                 stat.1 = count;
             }
         } else {
+            stats.sort_by_key(|(v, _)| *v);
             Self::count_occurrences(&mut stats, poly);
         }
 
         // Each key once (a comparison sort would evaluate it, with its two map look-ups, at every
-        // comparison). Ordering by (key, variable) is the stable order by key of `stats`, which
-        // is sorted by variable.
-        let mut keyed: Vec<(u32, VarId)> = stats
+        // comparison). Ordering by (key, variable) is the stable order by key of the candidates
+        // sorted by variable; a heap is built in linear time and yields that order.
+        stats
             .into_iter()
             .map(|(v, count)| {
                 let sub_size = substitutions.get(&v).map(|s| s.size()).unwrap_or(0) as u32;
                 let penalty = *self.penalty.entry(v).or_insert(1);
-                (count.saturating_mul(sub_size).saturating_mul(penalty), v)
+                Reverse((count.saturating_mul(sub_size).saturating_mul(penalty), v))
             })
-            .collect();
-        keyed.sort_unstable();
-        keyed.into_iter().map(|(_, v)| v).collect()
+            .collect()
     }
 
     /// Counts, for each candidate of `stats` (sorted by variable), the terms of `poly` holding it.
