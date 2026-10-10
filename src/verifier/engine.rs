@@ -1,6 +1,6 @@
 use super::{
-    ReductionAction, ReductionContext, ReductionMeta, ReductionPolicy, ReductionState, SizeGuard,
-    Substitution, VarDomain, process_cone,
+    Domain, FlipManager, ReductionAction, ReductionContext, ReductionMeta, ReductionPolicy,
+    ReductionState, SizeGuard, Substitution, VarDomain, process_cone,
 };
 use crate::Result;
 use crate::bipoly::{Polynomial, VarId};
@@ -14,7 +14,41 @@ pub struct ReductionEngine<'a> {
     pub size_limit: Option<usize>,
 }
 
+/// The engine at a point it can return to (see [`ReductionEngine::checkpoint`]).
+pub struct Checkpoint {
+    var_domain: Domain,
+    flip_manager: Option<FlipManager>,
+    seq_len: usize,
+    sizes_len: usize,
+}
+
 impl<'a> ReductionEngine<'a> {
+    /// Marks the current state for [`restore`](Self::restore): the polynomial records its changes
+    /// from here on (a probe touches few of its terms), the small fields are copied.
+    pub fn checkpoint(&mut self) -> Checkpoint {
+        self.state.poly.checkpoint();
+        Checkpoint {
+            var_domain: self.state.var_domain.clone(),
+            flip_manager: self.state.flip_manager.clone(),
+            seq_len: self.state.global_seq.len(),
+            sizes_len: self.state.poly_sizes.len(),
+        }
+    }
+
+    /// Returns to the state at `checkpoint`; the polynomial goes on recording from there.
+    pub fn restore(&mut self, checkpoint: &Checkpoint) {
+        self.state.poly.rollback();
+        self.state.var_domain = checkpoint.var_domain.clone();
+        self.state.flip_manager = checkpoint.flip_manager.clone();
+        self.state.global_seq.truncate(checkpoint.seq_len);
+        self.state.poly_sizes.truncate(checkpoint.sizes_len);
+    }
+
+    /// Keeps the current state and stops recording.
+    pub fn release_checkpoint(&mut self) {
+        self.state.poly.clear_checkpoint();
+    }
+
     pub fn new(
         name: impl Into<String>,
         ctx: &'a ReductionContext,
@@ -104,7 +138,7 @@ impl<'a> ReductionEngine<'a> {
                     self.size_limit,
                     self.state.flip_manager.as_mut(),
                 )?;
-                self.state.poly = new_poly;
+                self.state.poly.replace(new_poly);
                 self.state.global_seq.extend(cone_seq);
                 self.state.poly_sizes.extend(poly_sizes);
                 Ok(None)
@@ -142,9 +176,6 @@ impl<'a> ReductionEngine<'a> {
                         self.write_partial_meta()?;
                         return Err(err);
                     }
-                }
-                ReductionAction::Replace(state) => {
-                    self.state = state;
                 }
                 ReductionAction::Skip => {}
             }

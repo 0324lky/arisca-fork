@@ -33,7 +33,7 @@ impl FlipManager {
                     );
                     self.flipped_vars.insert(*v);
                 } else {
-                    *poly = origin_poly;
+                    poly.replace(origin_poly);
                 }
             }
         }

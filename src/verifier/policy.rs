@@ -1,4 +1,4 @@
-use super::{ReductionEngine, ReductionState, SizeGuard, Substitution, VarDomain};
+use super::{ReductionEngine, SizeGuard, Substitution, VarDomain};
 use crate::{
     Result,
     bipoly::{Polynomial, VarId},
@@ -11,7 +11,6 @@ const PROBE_ABORT_RATIO: usize = 5;
 
 pub enum ReductionAction {
     Reduce(VarId),
-    Replace(ReductionState),
     Skip,
     Stop,
 }
@@ -66,15 +65,15 @@ impl ReductionPolicy for LazyGreedyPolicy {
             &engine.state.poly,
             &engine.ctx.substitutions,
         );
-        let origin_state = engine.state.clone();
         let current_size = engine.state.poly.size();
-        let mut best_candidate: Option<(f64, VarId, ReductionState)> = None;
+        let mut best_candidate: Option<(f64, VarId)> = None;
 
         let guard = SizeGuard::new(current_size.saturating_mul(PROBE_ABORT_RATIO));
+        let checkpoint = engine.checkpoint();
         for &var in &candidates {
             if let Err(err) = engine.reduce_var(var, Some(&guard)) {
                 debug_step!(engine.name; fallback; "Probing failed", var; "Error: {:?}", err);
-                engine.state = origin_state.clone();
+                engine.restore(&checkpoint);
                 continue;
             }
             let ratio =
@@ -84,25 +83,25 @@ impl ReductionPolicy for LazyGreedyPolicy {
                 "Ratio: {:.3}", ratio
             );
             if ratio < self.max_ratio {
+                engine.release_checkpoint();
                 debug_step!(engine.name; progress; "Chosen var", var; "Action: Skip");
                 return Ok(ReductionAction::Skip);
             } else {
                 let value = self.penalty.entry(var).or_insert(1);
                 *value = value.saturating_mul(2);
-                match best_candidate {
-                    None => best_candidate = Some((ratio, var, engine.state.clone())),
-                    Some((best_ratio, _, _)) => {
-                        if ratio < best_ratio {
-                            best_candidate = Some((ratio, var, engine.state.clone()));
-                        }
-                    }
+                if best_candidate.is_none_or(|(best_ratio, _)| ratio < best_ratio) {
+                    best_candidate = Some((ratio, var));
                 }
-                engine.state = origin_state.clone();
+                engine.restore(&checkpoint);
             }
         }
-        if let Some((_, var, state)) = best_candidate {
+        engine.release_checkpoint();
+        if let Some((_, var)) = best_candidate {
             debug_step!(engine.name; progress; "Chosen var", var; "Action: Replace");
-            return Ok(ReductionAction::Replace(state));
+            // Every probe was undone: replay the best one, under the guard its probe passed,
+            // instead of keeping a copy of its state.
+            engine.reduce_var(var, Some(&guard))?;
+            return Ok(ReductionAction::Skip);
         } else {
             return Ok(ReductionAction::Reduce(candidates[0]));
         }

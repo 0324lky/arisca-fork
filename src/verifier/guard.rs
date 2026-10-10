@@ -81,21 +81,19 @@ impl Polynomial {
         guard: &SizeGuard,
     ) -> Result<(), SizeLimitExceeded> {
         if self.is_zero() || rhs.is_zero() {
-            self.terms.clear();
+            self.replace(Polynomial::new());
             return Ok(());
         }
 
         let mut next_map = Polynomial::new();
-        let lhs_map = std::mem::take(&mut self.terms);
-
-        for (t1, c1) in lhs_map.iter() {
+        for (t1, c1) in self.terms.iter() {
             for (t2, c2) in rhs.terms.iter() {
                 let merged_term = t1.mul(t2);
                 let prod = Integer::from(c1 * c2);
                 next_map.insert_checked(merged_term, prod, guard)?
             }
         }
-        self.terms = next_map.terms;
+        self.replace(next_map);
         Ok(())
     }
 
@@ -106,14 +104,10 @@ impl Polynomial {
         guard: &SizeGuard,
     ) -> Result<(), SizeLimitExceeded> {
         let mut new_poly = Polynomial::new();
-        self.terms.retain(|term, coeff| {
-            if let Some(new_term) = term.remove_var(v) {
-                new_poly += Polynomial::from_term(new_term, coeff.clone()) * poly;
-                false
-            } else {
-                true
-            }
-        });
+        for (term, coeff) in self.remove_terms_with(v) {
+            let new_term = term.remove_var(v).expect("the term holds v");
+            new_poly += Polynomial::from_term(new_term, coeff) * poly;
+        }
         self.add_assign_checked(new_poly, guard)
     }
 }
