@@ -1,6 +1,7 @@
+use super::topo::DomainCheckpoint;
 use super::{
-    Domain, FlipManager, ReductionAction, ReductionContext, ReductionMeta, ReductionPolicy,
-    ReductionState, SizeGuard, Substitution, VarDomain, process_cone,
+    FlipManager, ReductionAction, ReductionContext, ReductionMeta, ReductionPolicy, ReductionState,
+    SizeGuard, Substitution, VarDomain, process_cone,
 };
 use crate::Result;
 use crate::bipoly::{Polynomial, Term, VarId};
@@ -32,7 +33,7 @@ fn vanishes(term: &Term) -> bool {
 
 /// The engine at a point it can return to (see [`ReductionEngine::checkpoint`]).
 pub struct Checkpoint {
-    var_domain: Domain,
+    var_domain: DomainCheckpoint,
     flip_manager: Option<FlipManager>,
     seq_len: usize,
     sizes_len: usize,
@@ -40,12 +41,13 @@ pub struct Checkpoint {
 }
 
 impl<'a> ReductionEngine<'a> {
-    /// Marks the current state for [`restore`](Self::restore): the polynomial records its changes
-    /// from here on (a probe touches few of its terms), the small fields are copied.
+    /// Marks the current state for [`restore`](Self::restore): the polynomial and the candidate
+    /// domain record their changes from here on (a probe touches few of their entries), the
+    /// small fields are copied.
     pub fn checkpoint(&mut self) -> Checkpoint {
         self.state.poly.checkpoint();
         Checkpoint {
-            var_domain: self.state.var_domain.clone(),
+            var_domain: self.state.var_domain.checkpoint(),
             flip_manager: self.state.flip_manager.clone(),
             seq_len: self.state.global_seq.len(),
             sizes_len: self.state.poly_sizes.len(),
@@ -56,7 +58,7 @@ impl<'a> ReductionEngine<'a> {
     /// Returns to the state at `checkpoint`; the polynomial goes on recording from there.
     pub fn restore(&mut self, checkpoint: &Checkpoint) {
         self.state.poly.rollback();
-        self.state.var_domain = checkpoint.var_domain.clone();
+        self.state.var_domain.restore(&checkpoint.var_domain);
         self.state.flip_manager = checkpoint.flip_manager.clone();
         self.state.global_seq.truncate(checkpoint.seq_len);
         self.state.poly_sizes.truncate(checkpoint.sizes_len);
@@ -66,6 +68,7 @@ impl<'a> ReductionEngine<'a> {
     /// Keeps the current state and stops recording.
     pub fn release_checkpoint(&mut self) {
         self.state.poly.clear_checkpoint();
+        self.state.var_domain.clear_checkpoint();
     }
 
     pub fn new(

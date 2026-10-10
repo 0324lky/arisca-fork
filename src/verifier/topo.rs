@@ -14,6 +14,8 @@ pub struct TopoVar {
     adj: Arc<HashMap<VarId, Vec<VarId>>>,
     in_degree: HashMap<VarId, usize>,
     queue: Vec<VarId>,
+    /// While a checkpoint is active: each in-degree `update` lowered, with its earlier value.
+    log: Option<Vec<(VarId, usize)>>,
 }
 
 impl TopoVar {
@@ -33,7 +35,28 @@ impl TopoVar {
             adj: Arc::new(adj),
             in_degree,
             queue,
+            log: None,
         }
+    }
+
+    /// Starts recording in-degree changes; returns the ready queue to restore with.
+    fn checkpoint(&mut self) -> Vec<VarId> {
+        self.log = Some(Vec::new());
+        self.queue.clone()
+    }
+
+    /// Returns to the checkpoint, given its ready queue; recording goes on from there.
+    fn rollback(&mut self, queue: &[VarId]) {
+        if let Some(log) = &mut self.log {
+            for (v, degree) in log.drain(..).rev() {
+                *self
+                    .in_degree
+                    .get_mut(&v)
+                    .expect("a logged vertex has an in-degree") = degree;
+            }
+        }
+        self.queue.clear();
+        self.queue.extend_from_slice(queue);
     }
 
     pub fn bfs(&self) -> Vec<VarId> {
@@ -99,6 +122,9 @@ impl VarDomain for TopoVar {
         if let Some(neighbors) = self.adj.get(&target) {
             for neighbor in neighbors {
                 if let Some(deg) = self.in_degree.get_mut(neighbor) {
+                    if let Some(log) = &mut self.log {
+                        log.push((*neighbor, *deg));
+                    }
                     *deg -= 1;
                     if *deg == 0 {
                         self.queue.push(*neighbor);
@@ -146,6 +172,40 @@ impl VarDomain for VecVar {
 pub enum Domain {
     Topo(TopoVar),
     Vec(VecVar),
+}
+
+/// A candidate domain at a point it can return to (see [`Domain::checkpoint`]).
+pub enum DomainCheckpoint {
+    /// A topological domain logs its in-degree changes; the checkpoint keeps its ready queue.
+    Topo(Vec<VarId>),
+    /// Any other domain is copied.
+    Copy(Domain),
+}
+
+impl Domain {
+    /// Marks the current state for [`restore`](Self::restore) without copying a topological
+    /// domain's in-degree map (one entry per node).
+    pub fn checkpoint(&mut self) -> DomainCheckpoint {
+        match self {
+            Domain::Topo(topo) => DomainCheckpoint::Topo(topo.checkpoint()),
+            other => DomainCheckpoint::Copy(other.clone()),
+        }
+    }
+
+    pub fn restore(&mut self, checkpoint: &DomainCheckpoint) {
+        match (self, checkpoint) {
+            (Domain::Topo(topo), DomainCheckpoint::Topo(queue)) => topo.rollback(queue),
+            (domain, DomainCheckpoint::Copy(copy)) => *domain = copy.clone(),
+            _ => unreachable!("a checkpoint of another kind of domain"),
+        }
+    }
+
+    /// Keeps the current state and stops recording.
+    pub fn clear_checkpoint(&mut self) {
+        if let Domain::Topo(topo) = self {
+            topo.log = None;
+        }
+    }
 }
 
 impl VarDomain for Domain {
