@@ -137,13 +137,19 @@ impl LazyGreedyPolicy {
             Self::count_occurrences(&mut stats, poly);
         }
 
-        stats.sort_by_key(|(v, count)| {
-            let sub_size = substitutions.get(v).map(|s| s.size()).unwrap_or(0) as u32;
-            count
-                .saturating_mul(sub_size)
-                .saturating_mul(*self.penalty.entry(*v).or_insert(1))
-        });
-        stats.into_iter().map(|(v, _)| v).collect()
+        // Each key once (a comparison sort would evaluate it, with its two map look-ups, at every
+        // comparison). Ordering by (key, variable) is the stable order by key of `stats`, which
+        // is sorted by variable.
+        let mut keyed: Vec<(u32, VarId)> = stats
+            .into_iter()
+            .map(|(v, count)| {
+                let sub_size = substitutions.get(&v).map(|s| s.size()).unwrap_or(0) as u32;
+                let penalty = *self.penalty.entry(v).or_insert(1);
+                (count.saturating_mul(sub_size).saturating_mul(penalty), v)
+            })
+            .collect();
+        keyed.sort_unstable();
+        keyed.into_iter().map(|(_, v)| v).collect()
     }
 
     /// Counts, for each candidate of `stats` (sorted by variable), the terms of `poly` holding it.
